@@ -1,0 +1,99 @@
+name: Build APK from HTML project
+
+on:
+  repository_dispatch:
+    types: [build_apk]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BRANCH: ${{ github.event.client_payload.branch }}
+    steps:
+      - name: Validate dispatch payload
+        run: |
+          if [ -z "${{ github.event.client_payload.branch }}" ]; then
+            echo "::error::No 'branch' was received in the repository_dispatch payload."
+            echo "This usually means the Android app's dispatch call didn't include client_payload.branch,"
+            echo "or this workflow was re-run manually from the GitHub UI (repository_dispatch payloads"
+            echo "cannot be replayed that way — trigger a fresh build from the app instead)."
+            exit 1
+          fi
+          echo "Building branch: ${{ github.event.client_payload.branch }}"
+
+      - name: Checkout build branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.branch }}
+          fetch-depth: 0
+
+      - name: Verify config.json exists on this branch
+        run: |
+          if [ ! -f "config.json" ]; then
+            echo "::error::config.json was not found on branch '$BRANCH' after checkout."
+            echo "The Android app should upload config.json to this branch BEFORE triggering the build."
+            echo "Files present at repo root:"
+            ls -la
+            exit 1
+          fi
+          echo "config.json found:"
+          cat config.json
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK licenses & install required packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Inject app config into template project
+        run: python3 scripts/inject_config.py
+
+      - name: Build release APK
+        working-directory: template-app
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Locate and rename APK
+        run: |
+          mkdir -p out
+          APK_PATH=$(find template-app/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::No APK was produced by the build."
+            exit 1
+          fi
+          cp "$APK_PATH" out/app-release.apk
+
+      - name: Publish GitHub Release with the APK
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.BRANCH }}
+          name: "Build ${{ env.BRANCH }}"
+          body: "Automatically generated APK for ${{ github.event.client_payload.app_name }} (${{ github.event.client_payload.package_name }})."
+          files: out/app-release.apk
+
+      - name: Clean up build branch on success
+        if: success()
+        run: |
+          git push origin --delete "$BRANCH" || true
